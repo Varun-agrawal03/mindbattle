@@ -161,7 +161,7 @@ io.on("connection", (socket) => {
       from:      room.players[pNum]?.name || "Unknown",
       playerNum: pNum,
       text:      clean,
-      time:      new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" }),
+      time:      new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" }),
     };
     room.chat.push(msg);
     if (room.chat.length > 50) room.chat.shift();

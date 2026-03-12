@@ -433,79 +433,174 @@ function removePlaceholder(){const ph=document.querySelector('.chat-placeholder'
 function updateUnread(){const b=document.getElementById('unread-badge');if(unreadCount>0){b.textContent=unreadCount;b.classList.add('show');}else b.classList.remove('show');}
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
-// ── VOICE CHAT (WebRTC) ───────────────────────────────────
+// ── VOICE CHAT (WebRTC) — Fixed v2 ──────────────────────
 //
-// The signaling flow:
-//   startVoiceCall() creates offer → sent via socket to server
-//   → server relays to opponent
-//   → opponent receives offer, creates answer → sent back
-//   → ICE candidates exchanged
-//   → RTCPeerConnection established → audio flows directly!
+// FIXES APPLIED:
+//  1. Added free TURN servers (Metered open relay) — fixes
+//     connection failure when both players are behind NAT/routers
+//  2. ICE candidate queue — candidates that arrive before
+//     setRemoteDescription() is done are queued and applied after,
+//     fixing the silent drop bug
+//  3. Better connection state handling with iceConnectionState
+//  4. Cleanup on every new call attempt to avoid stale state
 
-const ICE = { iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}] };
+// FIX 1: ICE servers now include TURN servers for NAT traversal.
+// STUN alone fails when both peers are behind routers (most real users).
+// These are free public TURN servers — for production use your own.
+const ICE = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    // Free public TURN servers (Open Relay by Metered)
+    { urls: 'turn:openrelay.metered.ca:80',      username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443',     username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  ]
+};
+
+// FIX 2: ICE candidate queue
+// Problem: ICE candidates can arrive via socket BEFORE setRemoteDescription()
+// finishes. addIceCandidate() throws if there's no remote description yet.
+// Solution: buffer them and flush once remote description is set.
+let pendingCandidates = [];
+let remoteDescSet = false;
+
+async function flushCandidates() {
+  for (const c of pendingCandidates) {
+    try { if (peerConn) await peerConn.addIceCandidate(new RTCIceCandidate(c)); } catch(e) {}
+  }
+  pendingCandidates = [];
+}
 
 async function startVoiceCall(){
   try{
-    // 1. Get microphone permission from browser
-    localStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
+    cleanupVoice(); // FIX 3: always clean up stale state before new call
+    remoteDescSet = false;
+    pendingCandidates = [];
+
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
     toast('🎤 Mic connected! Calling…');
     showVoiceUI('calling');
     startViz(localStream);
 
-    // 2. Create peer connection
-    peerConn=makePeer();
+    peerConn = makePeer();
+    localStream.getTracks().forEach(t => peerConn.addTrack(t, localStream));
 
-    // 3. Attach our audio to it
-    localStream.getTracks().forEach(t=>peerConn.addTrack(t,localStream));
-
-    // 4. Create SDP offer (our audio capabilities) and send to server
-    const offer=await peerConn.createOffer();
+    const offer = await peerConn.createOffer({ offerToReceiveAudio: true });
     await peerConn.setLocalDescription(offer);
-    socket.emit('webrtc_offer',{offer});
-  }catch(err){
-    if(err.name==='NotAllowedError')toast('❌ Mic permission denied!');
-    else toast('❌ Call failed: '+err.message);
+    socket.emit('webrtc_offer', { offer });
+  } catch(err) {
+    if (err.name === 'NotAllowedError') toast('❌ Mic permission denied! Allow mic in browser settings.');
+    else if (err.name === 'NotFoundError') toast('❌ No microphone found!');
+    else toast('❌ Call failed: ' + err.message);
     showVoiceUI('idle');
   }
 }
 
-// Opponent started a call — we receive their offer and create an answer
-socket.on('webrtc_offer',async({offer})=>{
-  try{
-    if(!localStream)localStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
-    startViz(localStream);showVoiceUI('calling');toast('📞 Incoming call! Connecting…');
-    peerConn=makePeer();
-    localStream.getTracks().forEach(t=>peerConn.addTrack(t,localStream));
+// Receive offer from opponent → create answer
+socket.on('webrtc_offer', async ({ offer }) => {
+  try {
+    cleanupVoice(); // clean up any previous call
+    remoteDescSet = false;
+    pendingCandidates = [];
+
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    startViz(localStream);
+    showVoiceUI('calling');
+    toast('📞 Incoming call! Connecting…');
+
+    peerConn = makePeer();
+    localStream.getTracks().forEach(t => peerConn.addTrack(t, localStream));
+
     await peerConn.setRemoteDescription(new RTCSessionDescription(offer));
-    const answer=await peerConn.createAnswer();
+    remoteDescSet = true;          // FIX 2: mark ready, then flush queued candidates
+    await flushCandidates();
+
+    const answer = await peerConn.createAnswer();
     await peerConn.setLocalDescription(answer);
-    socket.emit('webrtc_answer',{answer});
-  }catch(err){toast('❌ Could not connect: '+err.message);}
+    socket.emit('webrtc_answer', { answer });
+  } catch(err) {
+    console.error('offer handling failed:', err);
+    toast('❌ Could not connect voice: ' + err.message);
+    showVoiceUI('idle');
+  }
 });
 
-// We receive their answer — connection is almost ready
-socket.on('webrtc_answer',async({answer})=>{
-  try{if(peerConn)await peerConn.setRemoteDescription(new RTCSessionDescription(answer));}catch(e){}
+// Receive answer from opponent
+socket.on('webrtc_answer', async ({ answer }) => {
+  try {
+    if (!peerConn) return;
+    await peerConn.setRemoteDescription(new RTCSessionDescription(answer));
+    remoteDescSet = true;          // FIX 2: mark ready, then flush queued candidates
+    await flushCandidates();
+  } catch(e) { console.error('answer handling failed:', e); }
 });
 
-// Exchange network candidates so WebRTC can find a route
-socket.on('webrtc_ice',async({candidate})=>{
-  try{if(peerConn&&candidate)await peerConn.addIceCandidate(new RTCIceCandidate(candidate));}catch(e){}
+// Receive ICE candidate — queue it if remote desc not set yet
+socket.on('webrtc_ice', async ({ candidate }) => {
+  if (!candidate) return;
+  if (!peerConn) return;
+  if (!remoteDescSet) {
+    pendingCandidates.push(candidate); // FIX 2: queue it
+    return;
+  }
+  try { await peerConn.addIceCandidate(new RTCIceCandidate(candidate)); } catch(e) {}
 });
 
-socket.on('voice_ended',()=>{toast('📵 Call ended by opponent');cleanupVoice();showVoiceUI('idle');});
+socket.on('voice_ended', () => {
+  toast('📵 Call ended by opponent');
+  cleanupVoice();
+  showVoiceUI('idle');
+  addSysMsg('📵 Voice call ended.');
+});
 
-function makePeer(){
-  const pc=new RTCPeerConnection(ICE);
-  // Send our ICE candidates to opponent via server
-  pc.onicecandidate=({candidate})=>{if(candidate)socket.emit('webrtc_ice',{candidate});};
-  // When connection is established → show active UI, start timer
-  pc.onconnectionstatechange=()=>{
-    if(pc.connectionState==='connected'){showVoiceUI('active');startCallTimer();toast('🎤 Voice connected!',2000);addSysMsg('🎤 Voice call started!');}
-    else if(['disconnected','failed','closed'].includes(pc.connectionState)){showVoiceUI('idle');stopCallTimer();}
+function makePeer() {
+  const pc = new RTCPeerConnection(ICE);
+
+  // Send our ICE candidates to opponent via server (server just relays them)
+  pc.onicecandidate = ({ candidate }) => {
+    if (candidate) socket.emit('webrtc_ice', { candidate });
   };
-  // When opponent's audio arrives → play it through the hidden <audio> element
-  pc.ontrack=({streams})=>{document.getElementById('remote-audio').srcObject=streams[0];};
+
+  // FIX 3: watch BOTH connectionState AND iceConnectionState for reliability
+  pc.onconnectionstatechange = () => {
+    console.log('Connection state:', pc.connectionState);
+    if (pc.connectionState === 'connected') {
+      showVoiceUI('active');
+      startCallTimer();
+      toast('🎤 Voice connected! 🎉', 3000);
+      addSysMsg('🎤 Voice call connected!');
+    } else if (['disconnected', 'failed', 'closed'].includes(pc.connectionState)) {
+      showVoiceUI('idle');
+      stopCallTimer();
+      if (pc.connectionState === 'failed') toast('❌ Voice connection failed. Try again.');
+    }
+  };
+
+  // Backup: iceConnectionState catches some cases connectionState misses
+  pc.oniceconnectionstatechange = () => {
+    console.log('ICE state:', pc.iceConnectionState);
+    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      showVoiceUI('active');
+      startCallTimer();
+    }
+    if (pc.iceConnectionState === 'failed') {
+      toast('❌ ICE failed — trying to restart…');
+      pc.restartIce(); // ask WebRTC to retry finding a route
+    }
+  };
+
+  // When opponent's audio track arrives → play through hidden <audio> element
+  pc.ontrack = ({ streams }) => {
+    console.log('Remote audio track received!');
+    const audio = document.getElementById('remote-audio');
+    if (streams && streams[0]) {
+      audio.srcObject = streams[0];
+      // Some browsers need an explicit play() call
+      audio.play().catch(e => console.warn('Audio play failed:', e));
+    }
+  };
+
   return pc;
 }
 
